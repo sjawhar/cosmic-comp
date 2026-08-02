@@ -359,9 +359,9 @@ impl State {
         let backend = self.backend.kms();
 
         // recreate all graphics contexts
-        backend
-            .clear_used_devices()
-            .expect("This should never fail");
+        if let Err(err) = backend.clear_used_devices() {
+            warn!(?err, "Failed to clear graphics contexts");
+        }
         if let Err(err) = backend.refresh_used_devices() {
             warn!(?err, "Failed to re-create graphics contexts");
         }

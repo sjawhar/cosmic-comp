@@ -427,7 +427,7 @@ impl State {
                 .values_mut()
                 .flat_map(|device| device.inner.surfaces.values_mut())
             {
-                surface.remove_node(device.inner.render_node);
+                let _ = surface.remove_node(device.inner.render_node);
             }
             let syncobj_guard =
                 if is_primary && let Some(syncobj_state) = backend.syncobj_state.as_mut() {
@@ -1177,7 +1177,7 @@ impl InnerDevice {
         for surface in self.surfaces.values_mut() {
             let known_nodes = surface.known_nodes().clone();
             for gone_device in known_nodes.difference(used_devices) {
-                surface.remove_node(*gone_device);
+                surface.remove_node(*gone_device)?;
             }
             for new_device in used_devices.difference(&known_nodes) {
                 let (render_node, egl, gbm) = if self.render_node == *new_device {
@@ -1208,7 +1208,7 @@ impl InnerDevice {
                         ContextPriority::High,
                     )
                     .context("Failed to create shared EGL context")?,
-                );
+                )?;
             }
         }
 

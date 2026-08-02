@@ -108,6 +108,14 @@ use super::{drm_helpers, render::gles::GbmGlowBackend};
 #[cfg(feature = "debug")]
 use smithay_egui::EguiState;
 
+const SURFACE_THREAD_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn wait_for_surface_thread_reply<T>(receiver: Receiver<T>, timeout: Duration) -> Result<T> {
+    receiver
+        .recv_timeout(timeout)
+        .context("Surface thread did not reply")
+}
+
 #[derive(Debug)]
 pub struct Surface {
     pub(crate) connector: connector::Handle,
@@ -358,7 +366,12 @@ impl Surface {
         self.active.load(Ordering::SeqCst)
     }
 
-    pub fn add_node(&mut self, node: DrmNode, gbm: GbmAllocator<DrmDeviceFd>, egl: EGLContext) {
+    pub fn add_node(
+        &mut self,
+        node: DrmNode,
+        gbm: GbmAllocator<DrmDeviceFd>,
+        egl: EGLContext,
+    ) -> Result<()> {
         self.known_nodes.insert(node);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let _ = self.thread_command.send(ThreadCommand::NodeAdded {
@@ -367,10 +380,15 @@ impl Surface {
             egl,
             sync: tx,
         });
-        let _ = rx.recv();
+        if let Err(err) = wait_for_surface_thread_reply(rx, SURFACE_THREAD_REPLY_TIMEOUT) {
+            error!(output = %self.output.name(), device = ?node, ?err, "Surface thread failed to add render node");
+            return Err(err);
+        }
+
+        Ok(())
     }
 
-    pub fn remove_node(&mut self, node: DrmNode) {
+    pub fn remove_node(&mut self, node: DrmNode) -> Result<()> {
         self.known_nodes.remove(&node);
         self.feedback.remove(&node);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -379,7 +397,12 @@ impl Surface {
             .send(ThreadCommand::NodeRemoved { node, sync: tx });
         // Block so we can be sure the file descriptor is closed
         // (which is relevant for the udev device_removed callback).
-        let _ = rx.recv();
+        if let Err(err) = wait_for_surface_thread_reply(rx, SURFACE_THREAD_REPLY_TIMEOUT) {
+            error!(output = %self.output.name(), device = ?node, ?err, "Surface thread failed to remove render node");
+            return Err(err);
+        }
+
+        Ok(())
     }
 
     pub fn on_vblank(&self, metadata: Option<DrmEventMetadata>) {
@@ -409,7 +432,7 @@ impl Surface {
         let _ = self
             .thread_command
             .send(ThreadCommand::AdaptiveSyncAvailable(tx));
-        rx.recv().context("Surface thread died")?
+        wait_for_surface_thread_reply(rx, SURFACE_THREAD_REPLY_TIMEOUT)?
     }
 
     pub fn use_adaptive_sync(&mut self, vrr: AdaptiveSync) {
@@ -427,7 +450,9 @@ impl Surface {
     pub fn suspend(&mut self) {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let _ = self.thread_command.send(ThreadCommand::Suspend(tx));
-        let _ = rx.recv();
+        if let Err(err) = wait_for_surface_thread_reply(rx, SURFACE_THREAD_REPLY_TIMEOUT) {
+            error!(output = %self.output.name(), ?err, "Surface thread did not confirm suspend");
+        }
     }
 
     pub fn resume(
@@ -1967,4 +1992,16 @@ fn postprocess_elements<'a>(
     )
     .map(CosmicElement::<GlMultiRenderer>::Postprocess)
     .collect::<Vec<_>>()
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn surface_thread_reply_times_out_with_live_sender() {
+        let (_sender, receiver) = std::sync::mpsc::sync_channel::<()>(1);
+
+        assert!(wait_for_surface_thread_reply(receiver, Duration::from_millis(1)).is_err());
+    }
 }

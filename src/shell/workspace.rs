@@ -111,6 +111,9 @@ pub struct Workspace {
     pub pinned: bool,
     pub id: Option<String>,
     pub name: Option<String>,
+    /// Shortcut slot (`WorkspaceOnOutput` key number, 1-10) this workspace was
+    /// created for on its own output.
+    pub slot: Option<u8>,
 
     pub handle: WorkspaceHandle,
     pub focus_stack: FocusStacks,
@@ -402,6 +405,7 @@ impl Workspace {
             pinned: false,
             id: None,
             name: None,
+            slot: None,
             handle,
             focus_stack: FocusStacks::default(),
             image_copy: ImageCopySessions::default(),
@@ -436,6 +440,7 @@ impl Workspace {
             pinned: true,
             id: pinned.id.clone(),
             name: pinned.name.clone(),
+            slot: pinned.slot,
             handle,
             focus_stack: FocusStacks::default(),
             image_copy: ImageCopySessions::default(),
@@ -464,6 +469,7 @@ impl Workspace {
                 tiling_enabled: self.tiling_enabled,
                 id: self.id.clone(),
                 name: self.name.clone(),
+                slot: self.slot,
             })
         } else {
             None
@@ -576,6 +582,14 @@ impl Workspace {
         self.output_stack.front().unwrap()
     }
 
+    /// Whether `output` is this workspace's own output: the one it was created
+    /// on or last explicitly moved to, as opposed to one it only landed on
+    /// because its own output disconnected. `exact` also requires the
+    /// connector name to match, which is all that tells identical monitors apart.
+    pub fn is_native_to(&self, output: &Output, exact: bool) -> bool {
+        output_matches(self.explicit_output(), output, exact)
+    }
+
     // Set output the workspace is on
     //
     // If `explicit` is `true`, the user has explicitly moved the workspace
@@ -605,6 +619,8 @@ impl Workspace {
         }
         if explicit {
             self.output_stack.clear();
+            // The slot belonged to the old output's shortcuts; the user placed it here by hand.
+            self.slot = None;
         }
         if let Some(pos) = self
             .output_stack

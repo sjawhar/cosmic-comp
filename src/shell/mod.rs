@@ -83,8 +83,7 @@ use crate::{
                 toplevel_leave_output, toplevel_leave_workspace,
             },
             workspace::{
-                WorkspaceGroupHandle, WorkspaceHandle, WorkspaceIdAlreadySetError, WorkspaceState,
-                WorkspaceUpdateGuard,
+                WorkspaceGroupHandle, WorkspaceHandle, WorkspaceState, WorkspaceUpdateGuard,
             },
         },
     },
@@ -624,14 +623,36 @@ impl WorkspaceSet {
             self.theme.clone(),
             self.appearance,
         );
-        workspace_set_idx(
-            state,
-            self.workspaces.len() as u8 + 1,
-            &workspace.handle,
-            workspace.name.as_deref(),
-            // this method is only used by code paths related to dynamic workspaces, so this should be fine
-        );
         self.workspaces.push(workspace);
+        self.update_workspace_idxs(state);
+    }
+
+    fn insert_empty_workspace(
+        &mut self,
+        idx: usize,
+        slot: u8,
+        state: &mut WorkspaceUpdateGuard<State>,
+    ) {
+        let mut workspace = create_workspace(
+            state,
+            &self.output,
+            &self.group,
+            false,
+            self.tiling_enabled,
+            self.theme.clone(),
+            self.appearance,
+        );
+        workspace.slot = Some(slot);
+        self.workspaces.insert(idx, workspace);
+        if self.active >= idx {
+            self.active += 1;
+        }
+        if let Some((previous, _)) = &mut self.previously_active
+            && *previous >= idx
+        {
+            *previous += 1;
+        }
+        self.update_workspace_idxs(state);
     }
 
     fn ensure_last_empty(
@@ -639,11 +660,12 @@ impl WorkspaceSet {
         state: &mut WorkspaceUpdateGuard<State>,
         xdg_activation_state: &XdgActivationState,
     ) {
-        // add empty at the end, if necessary
+        // add empty at the end, if necessary; a workspace holding a shortcut slot
+        // never serves as the trailing empty one
         if self
             .workspaces
             .last()
-            .is_none_or(|last| !last.is_empty() || last.pinned)
+            .is_none_or(|last| !last.is_empty() || last.pinned || last.slot.is_some())
         {
             self.add_empty_workspace(state);
         }
@@ -659,7 +681,7 @@ impl WorkspaceSet {
                     && self
                         .workspaces
                         .get(i - 1)
-                        .is_some_and(|w| w.is_empty() && !w.pinned);
+                        .is_some_and(|w| w.is_empty() && !w.pinned && w.slot.is_none());
                 let keep = if workspace.can_auto_remove(xdg_activation_state) {
                     // Keep empty workspace if it's active, or it's the last workspace,
                     // and the previous worspace is not both active and empty.
@@ -689,13 +711,22 @@ impl WorkspaceSet {
     }
 
     fn update_workspace_idxs(&self, state: &mut WorkspaceUpdateGuard<'_, State>) {
+        // Once a set uses shortcut slots, a workspace is labelled by its slot, so the
+        // workspace a shortcut reaches keeps its number however many before it are
+        // empty or culled. One without a slot of its own here (the trailing empty one,
+        // one that migrated in) gets a mark no slot number can take.
+        let own_slot = |w: &Workspace| w.slot.filter(|_| w.is_native_to(&self.output, false));
+        let slotted = self.workspaces.iter().any(|w| own_slot(w).is_some());
         for (i, workspace) in self.workspaces.iter().enumerate() {
-            workspace_set_idx(
-                state,
-                i as u8 + 1,
-                &workspace.handle,
-                workspace.name.as_deref(),
-            );
+            let idx = i as u32 + 1;
+            let label = match (&workspace.name, own_slot(workspace)) {
+                (Some(name), _) => name.clone(),
+                (None, Some(slot)) => slot.to_string(),
+                (None, None) if slotted => "·".to_owned(),
+                (None, None) => idx.to_string(),
+            };
+            state.set_workspace_name(&workspace.handle, label);
+            state.set_workspace_coordinates(&workspace.handle, &[idx]);
         }
     }
 
@@ -907,6 +938,11 @@ impl Workspaces {
         set.workspaces.extend(moved_workspaces);
         if set.workspaces.is_empty() {
             set.add_empty_workspace(workspace_state);
+            // A new output starts on the workspace its first shortcut names, so a window
+            // opened there before any shortcut is still what slot 1 shows.
+            if self.mode == WorkspaceMode::OutputBound {
+                set.workspaces[0].slot = Some(1);
+            }
         }
         set.update_workspace_idxs(workspace_state);
         for (i, workspace) in set.workspaces.iter_mut().enumerate() {
@@ -919,39 +955,46 @@ impl Workspaces {
         self.sets.insert(output.clone(), set);
     }
 
-    pub fn ensure_pinned_workspaces(
+    /// Index of the workspace behind shortcut `slot` on `output`, creating an
+    /// empty one in slot order when the output has none.
+    ///
+    /// Slotted workspaces are ordinary dynamic workspaces: an empty one is
+    /// auto-removed once left, and disconnecting its output drops it if empty or
+    /// migrates it like any other workspace, so it returns carrying its slot
+    /// when the output reconnects. A migrated workspace answers only its own
+    /// output's shortcuts, except on an identical monitor sharing its EDID,
+    /// which is indistinguishable from its own output under a new connector
+    /// name. Global mode keeps every output's workspaces index-aligned, so
+    /// there the slot is a plain index, as with `Action::Workspace`.
+    pub fn slot_idx(
         &mut self,
         output: &Output,
-        count: usize,
+        slot: u8,
         workspace_state: &mut WorkspaceUpdateGuard<'_, State>,
-    ) -> Result<bool, WorkspaceIdAlreadySetError> {
-        let set = &mut self.sets[output];
-        let mut created = false;
-
-        while set.workspaces.len() < count {
-            set.add_empty_workspace(workspace_state);
-            let workspace_idx = set.workspaces.len() - 1;
-            let workspace = &mut set.workspaces[workspace_idx];
-            let id = random_workspace_id();
-            workspace.pinned = true;
-            workspace_state.set_id(&workspace.handle, &id)?;
-            workspace.id = Some(id);
-            workspace_state.add_workspace_state(&workspace.handle, WState::Pinned);
-            created = true;
-        }
-
+    ) -> usize {
         if self.mode == WorkspaceMode::Global {
-            for (other_output, set) in self.sets.iter_mut() {
-                if other_output == output {
-                    continue;
-                }
-                while set.workspaces.len() < count {
-                    set.add_empty_workspace(workspace_state);
-                }
-            }
+            return usize::from(slot) - 1;
         }
 
-        Ok(created)
+        let set = &mut self.sets[output];
+        let find = |exact| {
+            set.workspaces
+                .iter()
+                .position(|w| w.slot == Some(slot) && w.is_native_to(output, exact))
+        };
+        if let Some(idx) = find(true).or_else(|| find(false)) {
+            return idx;
+        }
+
+        let native = |w: &Workspace| w.slot.is_some() && w.is_native_to(output, false);
+        let idx = set
+            .workspaces
+            .iter()
+            .position(|w| native(w) && w.slot > Some(slot))
+            .or_else(|| set.workspaces.iter().rposition(native).map(|i| i + 1))
+            .unwrap_or(0);
+        set.insert_empty_workspace(idx, slot, workspace_state);
+        idx
     }
 
     pub fn remove_output<'a>(
@@ -1018,6 +1061,8 @@ impl Workspaces {
                         }
                     }
                 }
+
+                new_set.update_workspace_idxs(workspace_state);
 
                 for window in set.sticky_layer.mapped() {
                     for (surface, _) in window.windows() {
@@ -1206,6 +1251,14 @@ impl Workspaces {
             for workspace in set.workspaces.iter_mut() {
                 workspace.floating_layer.appearance = self.appearance;
                 workspace.tiling_layer.appearance = self.appearance;
+            }
+        }
+
+        // Global mode keeps outputs index-aligned and has no slots.
+        if old_mode != self.mode && self.mode == WorkspaceMode::Global {
+            for set in self.sets.values_mut() {
+                set.workspaces.iter_mut().for_each(|w| w.slot = None);
+                set.update_workspace_idxs(workspace_state);
             }
         }
 
@@ -5131,16 +5184,6 @@ impl Shell {
     }
 }
 
-fn workspace_set_idx(
-    state: &mut WorkspaceUpdateGuard<'_, State>,
-    idx: u8,
-    handle: &WorkspaceHandle,
-    name: Option<&str>,
-) {
-    state.set_workspace_name(handle, name.unwrap_or(&format!("{}", idx)));
-    state.set_workspace_coordinates(handle, &[idx as u32]);
-}
-
 pub fn check_grab_preconditions(
     seat: &Seat<State>,
     serial: Option<Serial>,
@@ -5192,13 +5235,9 @@ mod tests {
         reexports::wayland_server::Display,
     };
 
-    #[test]
-    fn ensure_pinned_workspaces_creates_and_pins_missing_workspaces() {
-        let display = Display::<State>::new().unwrap();
-        let mut workspace_state =
-            crate::wayland::protocols::workspace::WorkspaceState::new(&display.handle(), |_| true);
-        let output = Output::new(
-            "test-output".into(),
+    fn test_output(name: &str) -> Output {
+        Output::new(
+            name.into(),
             PhysicalProperties {
                 size: (200, 150).into(),
                 subpixel: Subpixel::HorizontalRgb,
@@ -5206,8 +5245,11 @@ mod tests {
                 model: "test".into(),
                 serial_number: "test".into(),
             },
-        );
-        let mut workspaces = Workspaces {
+        )
+    }
+
+    fn test_workspaces() -> Workspaces {
+        Workspaces {
             sets: IndexMap::new(),
             backup_set: None,
             layout: WorkspaceLayout::Horizontal,
@@ -5217,20 +5259,270 @@ mod tests {
             theme: cosmic::theme::system_preference(),
             appearance: AppearanceConfig::default(),
             persisted_workspaces: Vec::new(),
-        };
+        }
+    }
+
+    fn slots(workspaces: &Workspaces, output: &Output) -> Vec<Option<u8>> {
+        workspaces.sets[output]
+            .workspaces
+            .iter()
+            .map(|w| w.slot)
+            .collect()
+    }
+
+    #[test]
+    fn slot_workspaces_are_found_again_in_slot_order() {
+        let display = Display::<State>::new().unwrap();
+        let mut workspace_state =
+            crate::wayland::protocols::workspace::WorkspaceState::new(&display.handle(), |_| true);
+        let laptop = test_output("eDP-1");
+        let mut workspaces = test_workspaces();
+        workspaces.add_output(&laptop, &mut workspace_state.update());
+
+        workspaces.slot_idx(&laptop, 3, &mut workspace_state.update());
+        workspaces.slot_idx(&laptop, 2, &mut workspace_state.update());
+        let again = workspaces.slot_idx(&laptop, 3, &mut workspace_state.update());
+
+        assert_eq!(slots(&workspaces, &laptop), [Some(1), Some(2), Some(3)]);
+        assert_eq!(again, 2);
+    }
+
+    #[test]
+    fn new_outputs_first_workspace_is_slot_1() {
+        // A window opened on a monitor before any shortcut must still be what slot 1 shows.
+        let display = Display::<State>::new().unwrap();
+        let mut workspace_state =
+            crate::wayland::protocols::workspace::WorkspaceState::new(&display.handle(), |_| true);
+        let output = test_output("DP-2");
+        let mut workspaces = test_workspaces();
+        workspaces.add_output(&output, &mut workspace_state.update());
+        let first = workspaces.sets[&output].workspaces[0].handle;
+
+        let idx = workspaces.slot_idx(&output, 1, &mut workspace_state.update());
+
+        assert_eq!(workspaces.sets[&output].workspaces[idx].handle, first);
+    }
+
+    #[test]
+    fn empty_slot_workspace_is_removed_once_left() {
+        let display = Display::<State>::new().unwrap();
+        let mut workspace_state =
+            crate::wayland::protocols::workspace::WorkspaceState::new(&display.handle(), |_| true);
+        let xdg_activation_state = XdgActivationState::new::<State>(&display.handle());
+        let laptop = test_output("eDP-1");
+        let mut workspaces = test_workspaces();
+        workspaces.add_output(&laptop, &mut workspace_state.update());
+
+        for slot in [3, 1] {
+            let idx = workspaces.slot_idx(&laptop, slot, &mut workspace_state.update());
+            workspaces
+                .sets
+                .get_mut(&laptop)
+                .unwrap()
+                .activate(
+                    idx,
+                    WorkspaceDelta::new_shortcut(),
+                    &mut workspace_state.update(),
+                )
+                .unwrap();
+        }
+        workspaces.refresh(&mut workspace_state.update(), &xdg_activation_state);
+
+        assert_eq!(slots(&workspaces, &laptop), [Some(1), None]);
+    }
+
+    #[test]
+    fn disconnect_drops_empty_slot_workspaces() {
+        let display = Display::<State>::new().unwrap();
+        let mut workspace_state =
+            crate::wayland::protocols::workspace::WorkspaceState::new(&display.handle(), |_| true);
+        let xdg_activation_state = XdgActivationState::new::<State>(&display.handle());
+        let laptop = test_output("eDP-1");
+        let external = test_output("DP-1");
+        let mut workspaces = test_workspaces();
+        workspaces.add_output(&laptop, &mut workspace_state.update());
+        workspaces.add_output(&external, &mut workspace_state.update());
+
+        for slot in [1, 3] {
+            workspaces.slot_idx(&external, slot, &mut workspace_state.update());
+        }
+        workspaces.remove_output(
+            &external,
+            std::iter::empty(),
+            &mut workspace_state.update(),
+            &xdg_activation_state,
+        );
+
+        assert_eq!(slots(&workspaces, &laptop), [Some(1), None]);
+    }
+
+    #[test]
+    fn migrated_slot_workspace_answers_only_its_own_output() {
+        let display = Display::<State>::new().unwrap();
+        let mut workspace_state =
+            crate::wayland::protocols::workspace::WorkspaceState::new(&display.handle(), |_| true);
+        let xdg_activation_state = XdgActivationState::new::<State>(&display.handle());
+        let laptop = test_output("eDP-1");
+        let external = test_output("DP-1");
+        let mut workspaces = test_workspaces();
+        workspaces.add_output(&laptop, &mut workspace_state.update());
+        workspaces.add_output(&external, &mut workspace_state.update());
+
+        let idx = workspaces.slot_idx(&external, 1, &mut workspace_state.update());
+        // Pinned from the overview, it survives the disconnect like a workspace holding windows.
+        let migrant = &mut workspaces.sets.get_mut(&external).unwrap().workspaces[idx];
+        migrant.pinned = true;
+        let migrant = migrant.handle;
+        workspaces.remove_output(
+            &external,
+            std::iter::empty(),
+            &mut workspace_state.update(),
+            &xdg_activation_state,
+        );
+
+        let idx = workspaces.slot_idx(&laptop, 1, &mut workspace_state.update());
+        assert_ne!(workspaces.sets[&laptop].workspaces[idx].handle, migrant);
+
+        workspaces.add_output(&external, &mut workspace_state.update());
+        let idx = workspaces.slot_idx(&external, 1, &mut workspace_state.update());
+        assert_eq!(workspaces.sets[&external].workspaces[idx].handle, migrant);
+    }
+
+    #[test]
+    fn left_empty_slot_does_not_become_the_trailing_workspace() {
+        let display = Display::<State>::new().unwrap();
+        let mut workspace_state =
+            crate::wayland::protocols::workspace::WorkspaceState::new(&display.handle(), |_| true);
+        let xdg_activation_state = XdgActivationState::new::<State>(&display.handle());
+        let laptop = test_output("eDP-1");
+        let mut workspaces = test_workspaces();
+        workspaces.add_output(&laptop, &mut workspace_state.update());
+
+        for slot in [1, 2, 1] {
+            let idx = workspaces.slot_idx(&laptop, slot, &mut workspace_state.update());
+            let set = workspaces.sets.get_mut(&laptop).unwrap();
+            set.activate(
+                idx,
+                WorkspaceDelta::new_shortcut(),
+                &mut workspace_state.update(),
+            )
+            .unwrap();
+            // Pinned stands in for holding a window, so slot 1 is never culled.
+            if slot == 1 {
+                set.workspaces[idx].pinned = true;
+            }
+            workspaces.refresh(&mut workspace_state.update(), &xdg_activation_state);
+        }
+
+        // Slot 2 left behind as the last workspace would make move_current refuse
+        // to move slot 1's only window there.
+        assert_eq!(slots(&workspaces, &laptop), [Some(1), None]);
+    }
+
+    #[test]
+    fn explicitly_moved_workspace_gives_up_its_slot() {
+        let display = Display::<State>::new().unwrap();
+        let mut workspace_state =
+            crate::wayland::protocols::workspace::WorkspaceState::new(&display.handle(), |_| true);
+        let laptop = test_output("eDP-1");
+        let external = test_output("DP-1");
+        let mut workspaces = test_workspaces();
+        workspaces.add_output(&laptop, &mut workspace_state.update());
+        workspaces.add_output(&external, &mut workspace_state.update());
+
+        workspaces.slot_idx(&laptop, 1, &mut workspace_state.update());
+        let idx = workspaces.slot_idx(&external, 1, &mut workspace_state.update());
+        let moved = workspaces.sets[&external].workspaces[idx].handle;
+        workspaces.migrate_workspace(&external, &laptop, &moved, &mut workspace_state.update());
+
+        assert_eq!(slots(&workspaces, &laptop), [Some(1), None]);
+    }
+
+    #[test]
+    fn move_to_empty_next_slot_never_targets_the_last_workspace() {
+        // move_current refuses to move a workspace's only window to the next workspace when
+        // that one is the last and empty, so a window alone on slot 2 could not go to slot 3.
+        for visit_slot_3_first in [false, true] {
+            let display = Display::<State>::new().unwrap();
+            let mut workspace_state = crate::wayland::protocols::workspace::WorkspaceState::new(
+                &display.handle(),
+                |_| true,
+            );
+            let xdg_activation_state = XdgActivationState::new::<State>(&display.handle());
+            let output = test_output("DP-2");
+            let mut workspaces = test_workspaces();
+            workspaces.add_output(&output, &mut workspace_state.update());
+
+            let mut visit = |workspaces: &mut Workspaces, slot| {
+                let idx = workspaces.slot_idx(&output, slot, &mut workspace_state.update());
+                let set = workspaces.sets.get_mut(&output).unwrap();
+                set.activate(
+                    idx,
+                    WorkspaceDelta::new_shortcut(),
+                    &mut workspace_state.update(),
+                )
+                .unwrap();
+                // Pinned stands in for holding the window, so slot 2 is never culled.
+                if slot == 2 {
+                    set.workspaces[idx].pinned = true;
+                }
+                workspaces.refresh(&mut workspace_state.update(), &xdg_activation_state);
+            };
+            visit(&mut workspaces, 2);
+            if visit_slot_3_first {
+                visit(&mut workspaces, 3);
+                visit(&mut workspaces, 2);
+            }
+
+            let from = workspaces.sets[&output].active;
+            let to = workspaces.slot_idx(&output, 3, &mut workspace_state.update());
+            let last = workspaces.sets[&output].workspaces.len() - 1;
+            assert_eq!(to, from + 1, "visit_slot_3_first={visit_slot_3_first}");
+            assert_ne!(to, last, "visit_slot_3_first={visit_slot_3_first}");
+        }
+    }
+
+    #[test]
+    fn slot_keeps_its_number_when_an_empty_slot_before_it_is_culled() {
+        // Alt+5 then Alt+6 on empty slots: leaving slot 2 culls it, and slot 3 must still
+        // read "3" rather than take over slot 2's number.
+        let display = Display::<State>::new().unwrap();
+        let mut workspace_state =
+            crate::wayland::protocols::workspace::WorkspaceState::new(&display.handle(), |_| true);
+        let xdg_activation_state = XdgActivationState::new::<State>(&display.handle());
+        let output = test_output("eDP-1");
+        let mut workspaces = test_workspaces();
         workspaces.add_output(&output, &mut workspace_state.update());
 
-        let created = workspaces
-            .ensure_pinned_workspaces(&output, 3, &mut workspace_state.update())
+        for slot in [1, 2, 3] {
+            let idx = workspaces.slot_idx(&output, slot, &mut workspace_state.update());
+            let set = workspaces.sets.get_mut(&output).unwrap();
+            set.activate(
+                idx,
+                WorkspaceDelta::new_shortcut(),
+                &mut workspace_state.update(),
+            )
             .unwrap();
+            // Pinned stands in for holding a window, so slot 1 is never culled.
+            if slot == 1 {
+                set.workspaces[idx].pinned = true;
+            }
+            workspaces.refresh(&mut workspace_state.update(), &xdg_activation_state);
+        }
 
-        let workspaces = &workspaces.sets[&output].workspaces;
-        assert!(created);
-        assert_eq!(workspaces.len(), 3);
-        assert!(
-            workspaces[1..]
-                .iter()
-                .all(|workspace| workspace.pinned && workspace.id.is_some())
+        let names: Vec<_> = workspaces.sets[&output]
+            .workspaces
+            .iter()
+            .map(|w| {
+                workspace_state
+                    .update()
+                    .workspace_name(&w.handle)
+                    .map(str::to_owned)
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [Some("1".into()), Some("3".into()), Some("·".into())]
         );
     }
 }

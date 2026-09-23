@@ -588,16 +588,20 @@ impl State {
                     let shell = self.common.shell.read();
                     output_for_query(shell.outputs(), &query)
                 };
-                let workspace = match key_num {
-                    0 => 9,
-                    x => x - 1,
-                };
-
-                if let Some(output) = target_output {
-                    self.switch_to_output(&output, Some(workspace as usize), seat, serial, time);
-                } else {
+                let Some(output) = target_output else {
                     warn!("WorkspaceOnOutput: no output matches {query:?}");
-                }
+                    return;
+                };
+                let slot = match key_num {
+                    0 => 10,
+                    x => x,
+                };
+                let idx = self.common.shell.write().workspaces.slot_idx(
+                    &output,
+                    slot,
+                    &mut self.common.workspace_state.update(),
+                );
+                self.switch_to_output(&output, Some(idx), seat, serial, time);
             }
 
             x @ Action::MoveToWorkspaceOnOutput(..) | x @ Action::SendToWorkspaceOnOutput(..) => {
@@ -614,28 +618,19 @@ impl State {
                     warn!("Move/SendToWorkspaceOnOutput: no output matches {query:?}");
                     return;
                 };
-                let workspace = match key_num {
-                    0 => 9,
-                    x => x - 1,
+                let slot = match key_num {
+                    0 => 10,
+                    x => x,
                 };
                 let mut shell = self.common.shell.write();
                 let res = {
                     let mut workspace_guard = self.common.workspace_state.update();
-                    match shell.workspaces.ensure_pinned_workspaces(
-                        &target_output,
-                        workspace as usize + 1,
-                        &mut workspace_guard,
-                    ) {
-                        Ok(true) => shell.workspaces.persist(&self.common.config),
-                        Ok(false) => {}
-                        Err(err) => {
-                            error!(?err, "Failed to pin implicitly created workspaces");
-                            return;
-                        }
-                    }
+                    let idx = shell
+                        .workspaces
+                        .slot_idx(&target_output, slot, &mut workspace_guard);
                     shell.move_current(
                         seat,
-                        (&target_output, Some(workspace as usize)),
+                        (&target_output, Some(idx)),
                         follow,
                         None,
                         &mut workspace_guard,
@@ -1131,8 +1126,6 @@ impl State {
             let already_active = workspace_idx
                 .map(|idx| self.common.shell.read().workspaces.active_num(target).1 == idx)
                 .unwrap_or(true);
-            // Returning here means the requested index is already active, so it exists and needs
-            // no implicit creation.
             if already_active {
                 return;
             }
@@ -1141,20 +1134,6 @@ impl State {
         let mut shell = self.common.shell.write();
         let res = {
             let mut workspace_guard = self.common.workspace_state.update();
-            if let Some(workspace_idx) = workspace_idx {
-                match shell.workspaces.ensure_pinned_workspaces(
-                    target,
-                    workspace_idx + 1,
-                    &mut workspace_guard,
-                ) {
-                    Ok(true) => shell.workspaces.persist(&self.common.config),
-                    Ok(false) => {}
-                    Err(err) => {
-                        error!(?err, "Failed to pin implicitly created workspaces");
-                        return;
-                    }
-                }
-            }
             let idx = workspace_idx.unwrap_or_else(|| shell.workspaces.active_num(target).1);
             let res = shell.activate(
                 target,
@@ -1162,7 +1141,9 @@ impl State {
                 WorkspaceDelta::new_shortcut(),
                 &mut workspace_guard,
             );
-            seat.set_active_output(target);
+            if res.is_ok() {
+                seat.set_active_output(target);
+            }
             res
         };
 

@@ -64,4 +64,6 @@ pub struct PinnedWorkspace {
     pub tiling_enabled: bool,
     pub id: Option<String>,
     pub name: Option<String>,
+    #[serde(default)]
+    pub slot: Option<u8>,
 }
